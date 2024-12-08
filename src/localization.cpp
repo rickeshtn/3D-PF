@@ -15,8 +15,9 @@
 #include <numeric>
 
 struct Particle {
-    double x, y, yaw;
-    double weight;
+    double x, y, z;            // 3D position
+    double roll, pitch, yaw;   // 3D orientation
+    double weight;  
 };
 
 class ParticleFilterLocalization {
@@ -76,7 +77,7 @@ public:
         map_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/map_cloud", 1);
         publishMapCloud();
 
-        map_publish_timer_ = nh_.createTimer(ros::Duration(1.0), [this](const ros::TimerEvent&) {
+        map_publish_timer_ = nh_.createTimer(ros::Duration(5.0), [this](const ros::TimerEvent&) {
                 if (!map_cloud_.empty()) {
                     publishMapCloud();
                 } else {
@@ -84,7 +85,8 @@ public:
                 }
             });
 
-        odom_sub_ = nh_.subscribe("/kiss/odometry", 15, &ParticleFilterLocalization::odomCallback_smoothed, this);
+        //odom_sub_ = nh_.subscribe("/kiss/odometry", 15, &ParticleFilterLocalization::odomCallback_smoothed, this);
+        odom_sub_ = nh_.subscribe("/kiss/odometry", 15, &ParticleFilterLocalization::odomCallback, this);
         scan_sub_ = nh_.subscribe("/radar_data_topic", 1, &ParticleFilterLocalization::scanCallback, this);
         pose_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("pf_pose", 25);
 
@@ -121,31 +123,173 @@ private:
     void odomCallback_smoothed(const nav_msgs::OdometryConstPtr &odom) {
         current_odom_ = *odom;
         double dt = (current_odom_.header.stamp - last_odom_.header.stamp).toSec(); // Time difference
+
         if (!initialized_) {
             double x = current_odom_.pose.pose.position.x;
             double y = current_odom_.pose.pose.position.y;
-            double yaw = yawFromQuaternion(current_odom_.pose.pose.orientation);
+            double z = current_odom_.pose.pose.position.z; // Extract Z position
+            double roll, pitch, yaw;
+            tf2::Matrix3x3(tf2::Quaternion(
+                current_odom_.pose.pose.orientation.x,
+                current_odom_.pose.pose.orientation.y,
+                current_odom_.pose.pose.orientation.z,
+                current_odom_.pose.pose.orientation.w)).getRPY(roll, pitch, yaw); // Extract 3D orientation
 
             // Initialize EMA smoothed variables
             ema_x_ = x;
             ema_y_ = y;
+            ema_z_ = z; // Initialize Z smoothing
+            ema_roll_ = roll;
+            ema_pitch_ = pitch;
             ema_yaw_ = yaw;
 
             std::normal_distribution<double> dist_x(x, init_x_std_);
             std::normal_distribution<double> dist_y(y, init_y_std_);
+            std::normal_distribution<double> dist_z(z, init_z_std_); // Initialize Z noise
+            std::normal_distribution<double> dist_roll(roll, init_roll_std_);
+            std::normal_distribution<double> dist_pitch(pitch, init_pitch_std_);
             std::normal_distribution<double> dist_yaw(yaw, init_yaw_std_);
 
             particles_.resize(num_particles_);
             for (int i = 0; i < num_particles_; i++) {
                 particles_[i].x = dist_x(rng_);
                 particles_[i].y = dist_y(rng_);
+                particles_[i].z = dist_z(rng_);
+                particles_[i].roll = dist_roll(rng_);
+                particles_[i].pitch = dist_pitch(rng_);
                 particles_[i].yaw = dist_yaw(rng_);
                 particles_[i].weight = 1.0 / num_particles_;
             }
             initialized_ = true;
             map_based_pose_.x = x;
             map_based_pose_.y = y;
+            map_based_pose_.z = z;
+            map_based_pose_.roll = roll;
+            map_based_pose_.pitch = pitch;
             map_based_pose_.yaw = yaw;
+            last_odom_ = current_odom_;
+            ROS_INFO("Particle Filter initialized with %d particles.", num_particles_);
+        } else {
+            if (dt <= 0.0) {
+                ROS_WARN("Invalid or zero time difference (dt). Skipping odometry update.");
+                return;
+            }
+
+            // Extract raw odometry values
+            double raw_x = current_odom_.pose.pose.position.x;
+            double raw_y = current_odom_.pose.pose.position.y;
+            double raw_z = current_odom_.pose.pose.position.z;
+            double raw_roll, raw_pitch, raw_yaw;
+            tf2::Matrix3x3(tf2::Quaternion(
+                current_odom_.pose.pose.orientation.x,
+                current_odom_.pose.pose.orientation.y,
+                current_odom_.pose.pose.orientation.z,
+                current_odom_.pose.pose.orientation.w)).getRPY(raw_roll, raw_pitch, raw_yaw);
+
+            // Apply EMA smoothing
+            ema_x_ = alpha_ * raw_x + (1 - alpha_) * ema_x_;
+            ema_y_ = alpha_ * raw_y + (1 - alpha_) * ema_y_;
+            ema_z_ = alpha_ * raw_z + (1 - alpha_) * ema_z_;
+            ema_roll_ = alpha_ * raw_roll + (1 - alpha_) * ema_roll_;
+            ema_pitch_ = alpha_ * raw_pitch + (1 - alpha_) * ema_pitch_;
+            ema_yaw_ = alpha_ * raw_yaw + (1 - alpha_) * ema_yaw_;
+            ema_yaw_ = normalizeAngle(ema_yaw_); // Normalize the smoothed yaw
+
+            // Calculate deltas based on smoothed values
+            double dx = ema_x_ - last_smoothed_x_;
+            double dy = ema_y_ - last_smoothed_y_;
+            double dz = ema_z_ - last_smoothed_z_;
+            double droll = ema_roll_ - last_smoothed_roll_;
+            double dpitch = ema_pitch_ - last_smoothed_pitch_;
+            double dyaw = angleDiff(ema_yaw_, last_smoothed_yaw_);
+
+            // Update map-based pose
+            map_based_pose_.x += dx;
+            map_based_pose_.y += dy;
+            map_based_pose_.z += dz;
+            map_based_pose_.roll += droll;
+            map_based_pose_.pitch += dpitch;
+            map_based_pose_.yaw += dyaw;
+            map_based_pose_.yaw = normalizeAngle(map_based_pose_.yaw);
+
+            // Update particles for 3D motion
+            std::normal_distribution<double> dist_x(0.0, 0.1);
+            std::normal_distribution<double> dist_y(0.0, 0.1);
+            std::normal_distribution<double> dist_z(0.0, 0.1);  
+            std::normal_distribution<double> dist_roll(0.0, 0.05);
+            std::normal_distribution<double> dist_pitch(0.0, 0.05);
+            std::normal_distribution<double> dist_yaw(0.0, 0.05);
+
+            for (auto &p : particles_) {
+                // Update position
+                p.x += dx + dist_x(rng_);
+                p.y += dy + dist_y(rng_);
+                p.z += dz + dist_z(rng_);
+                
+                // Update orientation
+                p.roll += droll + dist_roll(rng_);
+                p.pitch += dpitch + dist_pitch(rng_);
+                p.yaw += dyaw + dist_yaw(rng_);
+                p.yaw = normalizeAngle(p.yaw); 
+            }
+
+            // Store smoothed values as the last pose
+            last_smoothed_x_ = ema_x_;
+            last_smoothed_y_ = ema_y_;
+            last_smoothed_z_ = ema_z_;
+            last_smoothed_roll_ = ema_roll_;
+            last_smoothed_pitch_ = ema_pitch_;
+            last_smoothed_yaw_ = ema_yaw_;
+
+            last_odom_ = current_odom_; // Update last odometry
+        }
+    }
+
+    void odomCallback(const nav_msgs::OdometryConstPtr &odom) 
+    {
+        current_odom_ = *odom;
+        double dt = (current_odom_.header.stamp - last_odom_.header.stamp).toSec(); // Time difference
+
+        if (!initialized_) {
+            double x = current_odom_.pose.pose.position.x;
+            double y = current_odom_.pose.pose.position.y;
+            double z = current_odom_.pose.pose.position.z;
+
+            double roll, pitch, yaw;
+            tf2::Matrix3x3(tf2::Quaternion(
+                current_odom_.pose.pose.orientation.x,
+                current_odom_.pose.pose.orientation.y,
+                current_odom_.pose.pose.orientation.z,
+                current_odom_.pose.pose.orientation.w)).getRPY(roll, pitch, yaw);
+
+            // Initialize particles
+            std::normal_distribution<double> dist_x(x, init_x_std_);
+            std::normal_distribution<double> dist_y(y, init_y_std_);
+            std::normal_distribution<double> dist_z(z, init_z_std_);
+            std::normal_distribution<double> dist_roll(roll, init_roll_std_);
+            std::normal_distribution<double> dist_pitch(pitch, init_pitch_std_);
+            std::normal_distribution<double> dist_yaw(yaw, init_yaw_std_);
+
+            particles_.resize(num_particles_);
+            for (int i = 0; i < num_particles_; i++) {
+                particles_[i].x = dist_x(rng_);
+                particles_[i].y = dist_y(rng_);
+                particles_[i].z = dist_z(rng_);
+                particles_[i].roll = dist_roll(rng_);
+                particles_[i].pitch = dist_pitch(rng_);
+                particles_[i].yaw = dist_yaw(rng_);
+                particles_[i].weight = 1.0 / num_particles_;
+            }
+
+            // Initialize map-based pose
+            map_based_pose_.x = x;
+            map_based_pose_.y = y;
+            map_based_pose_.z = z;
+            map_based_pose_.roll = roll;
+            map_based_pose_.pitch = pitch;
+            map_based_pose_.yaw = yaw;
+
+            initialized_ = true;
             last_odom_ = current_odom_;
             ROS_INFO("Particle Filter initialized with %d particles.", num_particles_);
         } 
@@ -155,47 +299,113 @@ private:
                 return;
             }
 
-            // Extract raw odometry values
-            double raw_x = current_odom_.pose.pose.position.x;
-            double raw_y = current_odom_.pose.pose.position.y;
-            double raw_yaw = yawFromQuaternion(current_odom_.pose.pose.orientation);
+            // Extract deltas from odometry
+            double dx = current_odom_.pose.pose.position.x - last_odom_.pose.pose.position.x;
+            double dy = current_odom_.pose.pose.position.y - last_odom_.pose.pose.position.y;
+            double dz = current_odom_.pose.pose.position.z - last_odom_.pose.pose.position.z;
 
-            // Apply EMA smoothing
-            ema_x_ = alpha_ * raw_x + (1 - alpha_) * ema_x_;
-            ema_y_ = alpha_ * raw_y + (1 - alpha_) * ema_y_;
-            ema_yaw_ = alpha_ * raw_yaw + (1 - alpha_) * ema_yaw_;
-            ema_yaw_ = normalizeAngle(ema_yaw_); // Normalize the smoothed yaw
+            double roll, pitch, yaw;
+            tf2::Matrix3x3(tf2::Quaternion(
+                current_odom_.pose.pose.orientation.x,
+                current_odom_.pose.pose.orientation.y,
+                current_odom_.pose.pose.orientation.z,
+                current_odom_.pose.pose.orientation.w)).getRPY(roll, pitch, yaw);
 
-            // Calculate deltas based on smoothed values
-            double dx = ema_x_ - last_smoothed_x_;
-            double dy = ema_y_ - last_smoothed_y_;
-            double dyaw = angleDiff(ema_yaw_, last_smoothed_yaw_);
+            double last_roll, last_pitch, last_yaw;
+            tf2::Matrix3x3(tf2::Quaternion(
+                last_odom_.pose.pose.orientation.x,
+                last_odom_.pose.pose.orientation.y,
+                last_odom_.pose.pose.orientation.z,
+                last_odom_.pose.pose.orientation.w)).getRPY(last_roll, last_pitch, last_yaw);
+
+            double droll = roll - last_roll;
+            double dpitch = pitch - last_pitch;
+            double dyaw = angleDiff(yaw, last_yaw);
+
+            // Calculate speed and angular rates
+            double distance = sqrt(dx * dx + dy * dy + dz * dz);
+            double speed = distance / dt;
+            double turn_rate = sqrt(droll * droll + dpitch * dpitch + dyaw * dyaw) / dt;
+
+            if ((speed < 0.05 || speed > 30.0) || (turn_rate > 10.0)) {
+                ROS_WARN("Irregular speed or turn rate. Skipping odometry update.");
+                return;
+            }
 
             // Update map-based pose
-            map_based_pose_.x += cos(map_based_pose_.yaw) * dx - sin(map_based_pose_.yaw) * dy;
-            map_based_pose_.y += sin(map_based_pose_.yaw) * dx + cos(map_based_pose_.yaw) * dy;
+            map_based_pose_.x += dx;
+            map_based_pose_.y += dy;
+            map_based_pose_.z += dz;
+            map_based_pose_.roll += droll;
+            map_based_pose_.pitch += dpitch;
             map_based_pose_.yaw += dyaw;
             map_based_pose_.yaw = normalizeAngle(map_based_pose_.yaw);
 
             // Update particles
             std::normal_distribution<double> dist_x(0.0, 0.1);
             std::normal_distribution<double> dist_y(0.0, 0.1);
+            std::normal_distribution<double> dist_z(0.0, 0.1);
+            std::normal_distribution<double> dist_roll(0.0, 0.05);
+            std::normal_distribution<double> dist_pitch(0.0, 0.05);
             std::normal_distribution<double> dist_yaw(0.0, 0.05);
 
             for (auto &p : particles_) {
-                p.x = map_based_pose_.x + dist_x(rng_);
-                p.y = map_based_pose_.y + dist_y(rng_);
-                p.yaw = map_based_pose_.yaw + dist_yaw(rng_);
+                p.x += dx + dist_x(rng_);
+                p.y += dy + dist_y(rng_);
+                p.z += dz + dist_z(rng_);
+                p.roll += droll + dist_roll(rng_);
+                p.pitch += dpitch + dist_pitch(rng_);
+                p.yaw += dyaw + dist_yaw(rng_);
                 p.yaw = normalizeAngle(p.yaw);
             }
 
-            // Store smoothed values as the last pose
-            last_smoothed_x_ = ema_x_;
-            last_smoothed_y_ = ema_y_;
-            last_smoothed_yaw_ = ema_yaw_;
-
-            last_odom_ = current_odom_; // Update last odometry
+            // Update last odometry
+            last_odom_ = current_odom_;
         }
+    }
+
+
+
+    void reinitializeParticles() {
+        double x = current_odom_.pose.pose.position.x;
+        double y = current_odom_.pose.pose.position.y;
+        double z = current_odom_.pose.pose.position.z;
+
+        double roll, pitch, yaw;
+        tf2::Matrix3x3(tf2::Quaternion(
+            current_odom_.pose.pose.orientation.x,
+            current_odom_.pose.pose.orientation.y,
+            current_odom_.pose.pose.orientation.z,
+            current_odom_.pose.pose.orientation.w)).getRPY(roll, pitch, yaw);
+
+        // Reinitialize particles with a larger spread
+        std::normal_distribution<double> dist_x(x, 5.0); // Wider spread
+        std::normal_distribution<double> dist_y(y, 5.0); // Wider spread
+        std::normal_distribution<double> dist_z(z, 2.0); // Wider spread
+        std::normal_distribution<double> dist_roll(roll, M_PI / 6); // 30 degrees spread
+        std::normal_distribution<double> dist_pitch(pitch, M_PI / 6);
+        std::normal_distribution<double> dist_yaw(yaw, M_PI / 4); // 45 degrees spread
+
+        particles_.resize(num_particles_);
+        for (int i = 0; i < num_particles_; i++) {
+            particles_[i].x = dist_x(rng_);
+            particles_[i].y = dist_y(rng_);
+            particles_[i].z = dist_z(rng_);
+            particles_[i].roll = dist_roll(rng_);
+            particles_[i].pitch = dist_pitch(rng_);
+            particles_[i].yaw = dist_yaw(rng_);
+            particles_[i].weight = 1.0 / num_particles_;
+        }
+
+        // Reset map-based pose
+        map_based_pose_.x = x;
+        map_based_pose_.y = y;
+        map_based_pose_.z = z;
+        map_based_pose_.roll = roll;
+        map_based_pose_.pitch = pitch;
+        map_based_pose_.yaw = yaw;
+
+        ROS_WARN("Reinitialized particles and map-based pose.");
     }
 
     void scanCallback(const sensor_msgs::PointCloud2ConstPtr &scan_msg) {
@@ -216,11 +426,20 @@ private:
         auto weight_start_time = ros::Time::now();
         // Update step: compute weights
         double total_weight = 0.0;
+
         for (auto &p : particles_) {
-            Eigen::Matrix4f transform = poseToMatrix(p.x, p.y, p.yaw);
+            // Create transformation based on particle pose
+            Eigen::Affine3f transform = Eigen::Affine3f::Identity();
+            transform.translation() << p.x, p.y, p.z;
+            transform.rotate(Eigen::AngleAxisf(p.roll, Eigen::Vector3f::UnitX()) *
+                            Eigen::AngleAxisf(p.pitch, Eigen::Vector3f::UnitY()) *
+                            Eigen::AngleAxisf(p.yaw, Eigen::Vector3f::UnitZ()));
+
+            // Transform scan points
             pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_scan(new pcl::PointCloud<pcl::PointXYZ>());
             pcl::transformPointCloud(filtered_scan, *transformed_scan, transform);
 
+            // Compute weight for transformed scan
             double w = computeWeight(transformed_scan);
             p.weight = w;
             total_weight += w;
@@ -247,12 +466,24 @@ private:
 
         // Compute inside map score
         // Use the best pose (weighted mean)
-        double best_x, best_y, best_yaw;
-        poseMean(best_x, best_y, best_yaw);
-        Eigen::Matrix4f mean_transform = poseToMatrix(best_x, best_y, best_yaw);
+        double best_x, best_y, best_z, best_roll, best_pitch, best_yaw;
+        poseMean(best_x, best_y, best_z, best_roll, best_pitch, best_yaw);
+        Eigen::Affine3f mean_transform = Eigen::Affine3f::Identity();
+        mean_transform.translation() << best_x, best_y, best_z;
+        mean_transform.rotate(Eigen::AngleAxisf(best_roll, Eigen::Vector3f::UnitX()) *
+                            Eigen::AngleAxisf(best_pitch, Eigen::Vector3f::UnitY()) *
+                            Eigen::AngleAxisf(best_yaw, Eigen::Vector3f::UnitZ()));
+
         pcl::PointCloud<pcl::PointXYZ>::Ptr mean_transformed_scan(new pcl::PointCloud<pcl::PointXYZ>());
         pcl::transformPointCloud(filtered_scan, *mean_transformed_scan, mean_transform);
         double inside_score = insideMapScore(mean_transformed_scan);
+
+        if (inside_score == 0.0) {
+            ROS_WARN("Inside map score is 0. Reinitializing particles.");
+            reinitializeParticles();
+            return;
+        }
+
         ROS_INFO_STREAM("Inside map score: " << inside_score);
 
         // Publish pose & path
@@ -317,46 +548,99 @@ private:
         particles_ = new_particles;
     }
 
-    void poseMean(double &x, double &y, double &yaw) {
-        x = 0; y = 0; 
-        double sx=0, sy=0;
-        for (auto &p : particles_) {
+    void poseMean(double &x, double &y, double &z, double &roll, double &pitch, double &yaw) {
+        x = 0.0; 
+        y = 0.0; 
+        z = 0.0;
+        double sx = 0.0, sy = 0.0;
+        roll = 0.0; 
+        pitch = 0.0;
+        double total_weight = 0.0;
+
+        for (const auto &p : particles_) {
             x += p.x * p.weight;
             y += p.y * p.weight;
-            sx += cos(p.yaw)*p.weight;
-            sy += sin(p.yaw)*p.weight;
+            z += p.z * p.weight;
+            roll += p.roll * p.weight;
+            pitch += p.pitch * p.weight;
+            sx += cos(p.yaw) * p.weight;
+            sy += sin(p.yaw) * p.weight;
+            total_weight += p.weight;
         }
-        yaw = atan2(sy, sx);
+
+        if (total_weight > 0) {
+            x /= total_weight;
+            y /= total_weight;
+            z /= total_weight;
+            roll /= total_weight;
+            pitch /= total_weight;
+            yaw = atan2(sy, sx);
+        } else {
+            ROS_WARN("Total weight of particles is zero during pose mean calculation.");
+        }
     }
 
-    void publishPose() {
-        double x, y, yaw;
-        poseMean(x, y, yaw);
 
+    void publishPose() {
+        double x = 0.0, y = 0.0, z = 0.0;
+        double roll = 0.0, pitch = 0.0, yaw = 0.0;
+
+        // Compute weighted mean for pose from particles
+        double total_weight = 0.0;
+        double sx = 0.0, sy = 0.0, sz = 0.0;
+        double sroll = 0.0, spitch = 0.0, syaw = 0.0;
+
+        for (const auto &p : particles_) {
+            x += p.x * p.weight;
+            y += p.y * p.weight;
+            z += p.z * p.weight;
+            sx += cos(p.yaw) * p.weight;
+            sy += sin(p.yaw) * p.weight;
+            sroll += p.roll * p.weight;
+            spitch += p.pitch * p.weight;
+            total_weight += p.weight;
+        }
+
+        if (total_weight > 0) {
+            x /= total_weight;
+            y /= total_weight;
+            z /= total_weight;
+            roll = sroll / total_weight;
+            pitch = spitch / total_weight;
+            yaw = atan2(sy, sx);
+        }
+
+        // Publish pose as a ROS PoseStamped message
         geometry_msgs::PoseStamped ps;
-        ps.header.frame_id = "map"; 
+        ps.header.frame_id = "map";
         ps.header.stamp = ros::Time::now();
         ps.pose.position.x = x;
         ps.pose.position.y = y;
-        ps.pose.position.z = 0;
+        ps.pose.position.z = z;
+
         tf2::Quaternion q;
-        q.setRPY(0,0,yaw);
+        q.setRPY(roll, pitch, yaw);
         ps.pose.orientation = tf2::toMsg(q);
 
+        // Log pose to CSV if enabled
         if (pose_log_.is_open()) {
             pose_log_ << ps.header.stamp.toSec() << "," 
-                      << x << "," 
-                      << y << "," 
-                      << yaw << "\n";
+                    << x << "," 
+                    << y << "," 
+                    << z << "," 
+                    << roll << "," 
+                    << pitch << "," 
+                    << yaw << "\n";
             pose_log_.flush();
         }
 
+        // Publish pose and update path
         pose_pub_.publish(ps);
-
         path_msg_.header.stamp = ps.header.stamp;
         path_msg_.poses.push_back(ps);
         path_pub_.publish(path_msg_);
     }
+
 
     static double yawFromQuaternion(const geometry_msgs::Quaternion &q) {
         tf2::Quaternion quat(q.x, q.y, q.z, q.w);
@@ -403,13 +687,13 @@ private:
     std::vector<Particle> particles_;
     int num_particles_;
     double resample_threshold_;
-    double init_x_std_, init_y_std_, init_yaw_std_;
+    double init_x_std_, init_y_std_, init_yaw_std_,init_z_std_, init_roll_std_, init_pitch_std_;
     double voxel_size_, voxel_scan_size_;
 
     std::mt19937 rng_;
 
     struct {
-        double x, y, yaw;
+        double x, y, yaw, z, roll, pitch;
     } map_based_pose_;
 
     bool debug_flag_ = false;
@@ -418,8 +702,12 @@ private:
     double ema_x_ = 0.0;
     double ema_y_ = 0.0;
     double ema_yaw_ = 0.0;
+    double ema_z_ = 0.0;
+    double ema_roll_ = 0.0;
+    double ema_pitch_ = 0.0;
+
     const double alpha_ = 0.5;
-    double last_smoothed_x_ = 0.0, last_smoothed_y_ = 0.0, last_smoothed_yaw_ = 0.0;
+    double last_smoothed_x_ = 0.0, last_smoothed_y_ = 0.0, last_smoothed_yaw_ = 0.0, last_smoothed_z_ = 0.0, last_smoothed_roll_ = 0.0, last_smoothed_pitch_ = 0.0;
 
     // Kalman filter state variables (not used in current logic)
     double kalman_x_ = 0.0, kalman_y_ = 0.0, kalman_yaw_ = 0.0;
