@@ -25,13 +25,13 @@ public:
     ParticleFilterLocalization(ros::NodeHandle &nh, ros::NodeHandle &pnh) : nh_(nh), pnh_(pnh), initialized_(false) {
         // Parameters
         pnh_.param<std::string>("map_path", map_path_, "/home/rickeshtn/Projects/berlin_company_data/ros1_accumulated_cloud/map_Manual.pcd");
-        pnh_.param<int>("num_particles", num_particles_, 1000); 
+        pnh_.param<int>("num_particles", num_particles_, 500); 
         pnh_.param<double>("resample_threshold", resample_threshold_, 0.75);
         pnh_.param<double>("init_x_std", init_x_std_, 1.0);
         pnh_.param<double>("init_y_std", init_y_std_, 1.0);
         pnh_.param<double>("init_yaw_std", init_yaw_std_, 0.1);
         pnh_.param<double>("voxel_size", voxel_size_, 0.5); 
-        pnh_.param<double>("voxel_scan_size_", voxel_scan_size_, 0.001); 
+        pnh_.param<double>("voxel_scan_size_", voxel_scan_size_, 0.01); 
 
         std::string csv_filename;
         pnh_.param<std::string>("pose_csv_file", csv_filename, "/tmp/pose_log.csv");
@@ -215,23 +215,22 @@ private:
             // Update particles for 3D motion
             std::normal_distribution<double> dist_x(0.0, 0.1);
             std::normal_distribution<double> dist_y(0.0, 0.1);
-            std::normal_distribution<double> dist_z(0.0, 0.1);  
+            std::normal_distribution<double> dist_z(0.0, 0.1);
             std::normal_distribution<double> dist_roll(0.0, 0.05);
             std::normal_distribution<double> dist_pitch(0.0, 0.05);
             std::normal_distribution<double> dist_yaw(0.0, 0.05);
 
-            for (auto &p : particles_) {
-                // Update position
-                p.x += dx + dist_x(rng_);
-                p.y += dy + dist_y(rng_);
-                p.z += dz + dist_z(rng_);
-                
-                // Update orientation
-                p.roll += droll + dist_roll(rng_);
-                p.pitch += dpitch + dist_pitch(rng_);
-                p.yaw += dyaw + dist_yaw(rng_);
-                p.yaw = normalizeAngle(p.yaw); 
+            #pragma omp parallel for
+            for (size_t i = 0; i < particles_.size(); ++i) {
+                particles_[i].x += dx + dist_x(rng_);
+                particles_[i].y += dy + dist_y(rng_);
+                particles_[i].z += dz + dist_z(rng_);
+                particles_[i].roll += droll + dist_roll(rng_);
+                particles_[i].pitch += dpitch + dist_pitch(rng_);
+                particles_[i].yaw += dyaw + dist_yaw(rng_);
+                particles_[i].yaw = normalizeAngle(particles_[i].yaw);
             }
+
 
             // Store smoothed values as the last pose
             last_smoothed_x_ = ema_x_;
@@ -427,13 +426,14 @@ private:
         // Update step: compute weights
         double total_weight = 0.0;
 
-        for (auto &p : particles_) {
+        #pragma omp parallel for reduction(+:total_weight)
+        for (size_t i = 0; i < particles_.size(); ++i) {
             // Create transformation based on particle pose
             Eigen::Affine3f transform = Eigen::Affine3f::Identity();
-            transform.translation() << p.x, p.y, p.z;
-            transform.rotate(Eigen::AngleAxisf(p.roll, Eigen::Vector3f::UnitX()) *
-                            Eigen::AngleAxisf(p.pitch, Eigen::Vector3f::UnitY()) *
-                            Eigen::AngleAxisf(p.yaw, Eigen::Vector3f::UnitZ()));
+            transform.translation() << particles_[i].x, particles_[i].y, particles_[i].z;
+            transform.rotate(Eigen::AngleAxisf(particles_[i].roll, Eigen::Vector3f::UnitX()) *
+                            Eigen::AngleAxisf(particles_[i].pitch, Eigen::Vector3f::UnitY()) *
+                            Eigen::AngleAxisf(particles_[i].yaw, Eigen::Vector3f::UnitZ()));
 
             // Transform scan points
             pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_scan(new pcl::PointCloud<pcl::PointXYZ>());
@@ -441,15 +441,17 @@ private:
 
             // Compute weight for transformed scan
             double w = computeWeight(transformed_scan);
-            p.weight = w;
+            particles_[i].weight = w;
+
+            // Accumulate total weight
             total_weight += w;
         }
 
-        auto weight_end_time = ros::Time::now();
-
+        // Normalize weights if total_weight > 0
         if (total_weight > 0) {
-            for (auto &p : particles_) {
-                p.weight /= total_weight;
+            #pragma omp parallel for
+            for (size_t i = 0; i < particles_.size(); ++i) {
+                particles_[i].weight /= total_weight;
             }
         } else {
             for (auto &p : particles_) {
