@@ -1,5 +1,7 @@
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <ros/ros.h>
+#include <sensor_msgs/PointCloud2.h>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <geometry_msgs/PoseStamped.h>
@@ -94,7 +96,15 @@ public:
         path_msg_.header.frame_id = "map";
 
         std::random_device rd;
-        rng_.seed(rd());
+        int max_threads = omp_get_max_threads();
+        rngs_.resize(max_threads);
+        {
+            std::random_device rd;
+            for (int t = 0; t < max_threads; t++) {
+                rngs_[t].seed(rd());
+            }
+        }
+
     }
 
 private:
@@ -120,129 +130,129 @@ private:
         ROS_INFO_STREAM("Published map cloud with " << map_cloud_.size() << " points.");
     }
 
-    void odomCallback_smoothed(const nav_msgs::OdometryConstPtr &odom) {
-        current_odom_ = *odom;
-        double dt = (current_odom_.header.stamp - last_odom_.header.stamp).toSec(); // Time difference
+    // void odomCallback_smoothed(const nav_msgs::OdometryConstPtr &odom) {
+    //     current_odom_ = *odom;
+    //     double dt = (current_odom_.header.stamp - last_odom_.header.stamp).toSec(); // Time difference
 
-        if (!initialized_) {
-            double x = current_odom_.pose.pose.position.x;
-            double y = current_odom_.pose.pose.position.y;
-            double z = current_odom_.pose.pose.position.z; // Extract Z position
-            double roll, pitch, yaw;
-            tf2::Matrix3x3(tf2::Quaternion(
-                current_odom_.pose.pose.orientation.x,
-                current_odom_.pose.pose.orientation.y,
-                current_odom_.pose.pose.orientation.z,
-                current_odom_.pose.pose.orientation.w)).getRPY(roll, pitch, yaw); // Extract 3D orientation
+    //     if (!initialized_) {
+    //         double x = current_odom_.pose.pose.position.x;
+    //         double y = current_odom_.pose.pose.position.y;
+    //         double z = current_odom_.pose.pose.position.z; // Extract Z position
+    //         double roll, pitch, yaw;
+    //         tf2::Matrix3x3(tf2::Quaternion(
+    //             current_odom_.pose.pose.orientation.x,
+    //             current_odom_.pose.pose.orientation.y,
+    //             current_odom_.pose.pose.orientation.z,
+    //             current_odom_.pose.pose.orientation.w)).getRPY(roll, pitch, yaw); // Extract 3D orientation
 
-            // Initialize EMA smoothed variables
-            ema_x_ = x;
-            ema_y_ = y;
-            ema_z_ = z; // Initialize Z smoothing
-            ema_roll_ = roll;
-            ema_pitch_ = pitch;
-            ema_yaw_ = yaw;
+    //         // Initialize EMA smoothed variables
+    //         ema_x_ = x;
+    //         ema_y_ = y;
+    //         ema_z_ = z; // Initialize Z smoothing
+    //         ema_roll_ = roll;
+    //         ema_pitch_ = pitch;
+    //         ema_yaw_ = yaw;
 
-            std::normal_distribution<double> dist_x(x, init_x_std_);
-            std::normal_distribution<double> dist_y(y, init_y_std_);
-            std::normal_distribution<double> dist_z(z, init_z_std_); // Initialize Z noise
-            std::normal_distribution<double> dist_roll(roll, init_roll_std_);
-            std::normal_distribution<double> dist_pitch(pitch, init_pitch_std_);
-            std::normal_distribution<double> dist_yaw(yaw, init_yaw_std_);
+    //         std::normal_distribution<double> dist_x(x, init_x_std_);
+    //         std::normal_distribution<double> dist_y(y, init_y_std_);
+    //         std::normal_distribution<double> dist_z(z, init_z_std_); // Initialize Z noise
+    //         std::normal_distribution<double> dist_roll(roll, init_roll_std_);
+    //         std::normal_distribution<double> dist_pitch(pitch, init_pitch_std_);
+    //         std::normal_distribution<double> dist_yaw(yaw, init_yaw_std_);
 
-            particles_.resize(num_particles_);
-            for (int i = 0; i < num_particles_; i++) {
-                particles_[i].x = dist_x(rng_);
-                particles_[i].y = dist_y(rng_);
-                particles_[i].z = dist_z(rng_);
-                particles_[i].roll = dist_roll(rng_);
-                particles_[i].pitch = dist_pitch(rng_);
-                particles_[i].yaw = dist_yaw(rng_);
-                particles_[i].weight = 1.0 / num_particles_;
-            }
-            initialized_ = true;
-            map_based_pose_.x = x;
-            map_based_pose_.y = y;
-            map_based_pose_.z = z;
-            map_based_pose_.roll = roll;
-            map_based_pose_.pitch = pitch;
-            map_based_pose_.yaw = yaw;
-            last_odom_ = current_odom_;
-            ROS_INFO("Particle Filter initialized with %d particles.", num_particles_);
-        } else {
-            if (dt <= 0.0) {
-                ROS_WARN("Invalid or zero time difference (dt). Skipping odometry update.");
-                return;
-            }
+    //         particles_.resize(num_particles_);
+    //         for (int i = 0; i < num_particles_; i++) {
+    //             particles_[i].x = dist_x(rng_);
+    //             particles_[i].y = dist_y(rng_);
+    //             particles_[i].z = dist_z(rng_);
+    //             particles_[i].roll = dist_roll(rng_);
+    //             particles_[i].pitch = dist_pitch(rng_);
+    //             particles_[i].yaw = dist_yaw(rng_);
+    //             particles_[i].weight = 1.0 / num_particles_;
+    //         }
+    //         initialized_ = true;
+    //         map_based_pose_.x = x;
+    //         map_based_pose_.y = y;
+    //         map_based_pose_.z = z;
+    //         map_based_pose_.roll = roll;
+    //         map_based_pose_.pitch = pitch;
+    //         map_based_pose_.yaw = yaw;
+    //         last_odom_ = current_odom_;
+    //         ROS_INFO("Particle Filter initialized with %d particles.", num_particles_);
+    //     } else {
+    //         if (dt <= 0.0) {
+    //             ROS_WARN("Invalid or zero time difference (dt). Skipping odometry update.");
+    //             return;
+    //         }
 
-            // Extract raw odometry values
-            double raw_x = current_odom_.pose.pose.position.x;
-            double raw_y = current_odom_.pose.pose.position.y;
-            double raw_z = current_odom_.pose.pose.position.z;
-            double raw_roll, raw_pitch, raw_yaw;
-            tf2::Matrix3x3(tf2::Quaternion(
-                current_odom_.pose.pose.orientation.x,
-                current_odom_.pose.pose.orientation.y,
-                current_odom_.pose.pose.orientation.z,
-                current_odom_.pose.pose.orientation.w)).getRPY(raw_roll, raw_pitch, raw_yaw);
+    //         // Extract raw odometry values
+    //         double raw_x = current_odom_.pose.pose.position.x;
+    //         double raw_y = current_odom_.pose.pose.position.y;
+    //         double raw_z = current_odom_.pose.pose.position.z;
+    //         double raw_roll, raw_pitch, raw_yaw;
+    //         tf2::Matrix3x3(tf2::Quaternion(
+    //             current_odom_.pose.pose.orientation.x,
+    //             current_odom_.pose.pose.orientation.y,
+    //             current_odom_.pose.pose.orientation.z,
+    //             current_odom_.pose.pose.orientation.w)).getRPY(raw_roll, raw_pitch, raw_yaw);
 
-            // Apply EMA smoothing
-            ema_x_ = alpha_ * raw_x + (1 - alpha_) * ema_x_;
-            ema_y_ = alpha_ * raw_y + (1 - alpha_) * ema_y_;
-            ema_z_ = alpha_ * raw_z + (1 - alpha_) * ema_z_;
-            ema_roll_ = alpha_ * raw_roll + (1 - alpha_) * ema_roll_;
-            ema_pitch_ = alpha_ * raw_pitch + (1 - alpha_) * ema_pitch_;
-            ema_yaw_ = alpha_ * raw_yaw + (1 - alpha_) * ema_yaw_;
-            ema_yaw_ = normalizeAngle(ema_yaw_); // Normalize the smoothed yaw
+    //         // Apply EMA smoothing
+    //         ema_x_ = alpha_ * raw_x + (1 - alpha_) * ema_x_;
+    //         ema_y_ = alpha_ * raw_y + (1 - alpha_) * ema_y_;
+    //         ema_z_ = alpha_ * raw_z + (1 - alpha_) * ema_z_;
+    //         ema_roll_ = alpha_ * raw_roll + (1 - alpha_) * ema_roll_;
+    //         ema_pitch_ = alpha_ * raw_pitch + (1 - alpha_) * ema_pitch_;
+    //         ema_yaw_ = alpha_ * raw_yaw + (1 - alpha_) * ema_yaw_;
+    //         ema_yaw_ = normalizeAngle(ema_yaw_); // Normalize the smoothed yaw
 
-            // Calculate deltas based on smoothed values
-            double dx = ema_x_ - last_smoothed_x_;
-            double dy = ema_y_ - last_smoothed_y_;
-            double dz = ema_z_ - last_smoothed_z_;
-            double droll = ema_roll_ - last_smoothed_roll_;
-            double dpitch = ema_pitch_ - last_smoothed_pitch_;
-            double dyaw = angleDiff(ema_yaw_, last_smoothed_yaw_);
+    //         // Calculate deltas based on smoothed values
+    //         double dx = ema_x_ - last_smoothed_x_;
+    //         double dy = ema_y_ - last_smoothed_y_;
+    //         double dz = ema_z_ - last_smoothed_z_;
+    //         double droll = ema_roll_ - last_smoothed_roll_;
+    //         double dpitch = ema_pitch_ - last_smoothed_pitch_;
+    //         double dyaw = angleDiff(ema_yaw_, last_smoothed_yaw_);
 
-            // Update map-based pose
-            map_based_pose_.x += dx;
-            map_based_pose_.y += dy;
-            map_based_pose_.z += dz;
-            map_based_pose_.roll += droll;
-            map_based_pose_.pitch += dpitch;
-            map_based_pose_.yaw += dyaw;
-            map_based_pose_.yaw = normalizeAngle(map_based_pose_.yaw);
+    //         // Update map-based pose
+    //         map_based_pose_.x += dx;
+    //         map_based_pose_.y += dy;
+    //         map_based_pose_.z += dz;
+    //         map_based_pose_.roll += droll;
+    //         map_based_pose_.pitch += dpitch;
+    //         map_based_pose_.yaw += dyaw;
+    //         map_based_pose_.yaw = normalizeAngle(map_based_pose_.yaw);
 
-            // Update particles for 3D motion
-            std::normal_distribution<double> dist_x(0.0, 0.1);
-            std::normal_distribution<double> dist_y(0.0, 0.1);
-            std::normal_distribution<double> dist_z(0.0, 0.1);
-            std::normal_distribution<double> dist_roll(0.0, 0.05);
-            std::normal_distribution<double> dist_pitch(0.0, 0.05);
-            std::normal_distribution<double> dist_yaw(0.0, 0.05);
+    //         // Update particles for 3D motion
+    //         std::normal_distribution<double> dist_x(0.0, 0.1);
+    //         std::normal_distribution<double> dist_y(0.0, 0.1);
+    //         std::normal_distribution<double> dist_z(0.0, 0.1);
+    //         std::normal_distribution<double> dist_roll(0.0, 0.05);
+    //         std::normal_distribution<double> dist_pitch(0.0, 0.05);
+    //         std::normal_distribution<double> dist_yaw(0.0, 0.05);
 
-            #pragma omp parallel for
-            for (size_t i = 0; i < particles_.size(); ++i) {
-                particles_[i].x += dx + dist_x(rng_);
-                particles_[i].y += dy + dist_y(rng_);
-                particles_[i].z += dz + dist_z(rng_);
-                particles_[i].roll += droll + dist_roll(rng_);
-                particles_[i].pitch += dpitch + dist_pitch(rng_);
-                particles_[i].yaw += dyaw + dist_yaw(rng_);
-                particles_[i].yaw = normalizeAngle(particles_[i].yaw);
-            }
+    //         #pragma omp parallel for
+    //         for (size_t i = 0; i < particles_.size(); ++i) {
+    //             particles_[i].x += dx + dist_x(rng_);
+    //             particles_[i].y += dy + dist_y(rng_);
+    //             particles_[i].z += dz + dist_z(rng_);
+    //             particles_[i].roll += droll + dist_roll(rng_);
+    //             particles_[i].pitch += dpitch + dist_pitch(rng_);
+    //             particles_[i].yaw += dyaw + dist_yaw(rng_);
+    //             particles_[i].yaw = normalizeAngle(particles_[i].yaw);
+    //         }
 
 
-            // Store smoothed values as the last pose
-            last_smoothed_x_ = ema_x_;
-            last_smoothed_y_ = ema_y_;
-            last_smoothed_z_ = ema_z_;
-            last_smoothed_roll_ = ema_roll_;
-            last_smoothed_pitch_ = ema_pitch_;
-            last_smoothed_yaw_ = ema_yaw_;
+    //         // Store smoothed values as the last pose
+    //         last_smoothed_x_ = ema_x_;
+    //         last_smoothed_y_ = ema_y_;
+    //         last_smoothed_z_ = ema_z_;
+    //         last_smoothed_roll_ = ema_roll_;
+    //         last_smoothed_pitch_ = ema_pitch_;
+    //         last_smoothed_yaw_ = ema_yaw_;
 
-            last_odom_ = current_odom_; // Update last odometry
-        }
-    }
+    //         last_odom_ = current_odom_; // Update last odometry
+    //     }
+    // }
 
     void odomCallback(const nav_msgs::OdometryConstPtr &odom) 
     {
@@ -270,13 +280,17 @@ private:
             std::normal_distribution<double> dist_yaw(yaw, init_yaw_std_);
 
             particles_.resize(num_particles_);
+
+            // Parallel initialization
+            #pragma omp parallel for
             for (int i = 0; i < num_particles_; i++) {
-                particles_[i].x = dist_x(rng_);
-                particles_[i].y = dist_y(rng_);
-                particles_[i].z = dist_z(rng_);
-                particles_[i].roll = dist_roll(rng_);
-                particles_[i].pitch = dist_pitch(rng_);
-                particles_[i].yaw = dist_yaw(rng_);
+                int tid = omp_get_thread_num(); 
+                particles_[i].x = dist_x(rngs_[tid]);
+                particles_[i].y = dist_y(rngs_[tid]);
+                particles_[i].z = dist_z(rngs_[tid]);
+                particles_[i].roll = dist_roll(rngs_[tid]);
+                particles_[i].pitch = dist_pitch(rngs_[tid]);
+                particles_[i].yaw = dist_yaw(rngs_[tid]);
                 particles_[i].weight = 1.0 / num_particles_;
             }
 
@@ -348,13 +362,15 @@ private:
             std::normal_distribution<double> dist_pitch(0.0, 0.05);
             std::normal_distribution<double> dist_yaw(0.0, 0.05);
 
+            #pragma omp parallel for
             for (auto &p : particles_) {
-                p.x += dx + dist_x(rng_);
-                p.y += dy + dist_y(rng_);
-                p.z += dz + dist_z(rng_);
-                p.roll += droll + dist_roll(rng_);
-                p.pitch += dpitch + dist_pitch(rng_);
-                p.yaw += dyaw + dist_yaw(rng_);
+                int tid = omp_get_thread_num(); 
+                p.x += dx + dist_x(rngs_[tid]);
+                p.y += dy + dist_y(rngs_[tid]);
+                p.z += dz + dist_z(rngs_[tid]);
+                p.roll += droll + dist_roll(rngs_[tid]);
+                p.pitch += dpitch + dist_pitch(rngs_[tid]);
+                p.yaw += dyaw + dist_yaw(rngs_[tid]);
                 p.yaw = normalizeAngle(p.yaw);
             }
 
@@ -386,16 +402,20 @@ private:
         std::normal_distribution<double> dist_yaw(yaw, M_PI / 4); // 45 degrees spread
 
         particles_.resize(num_particles_);
+        #pragma omp parallel for
         for (int i = 0; i < num_particles_; i++) {
-            particles_[i].x = dist_x(rng_);
-            particles_[i].y = dist_y(rng_);
-            particles_[i].z = dist_z(rng_);
-            particles_[i].roll = dist_roll(rng_);
-            particles_[i].pitch = dist_pitch(rng_);
-            particles_[i].yaw = dist_yaw(rng_);
+            int tid = omp_get_thread_num(); 
+            particles_[i].x = dist_x(rngs_[tid]);
+            particles_[i].y = dist_y(rngs_[tid]);
+            particles_[i].z = dist_z(rngs_[tid]);
+            particles_[i].roll = dist_roll(rngs_[tid]);
+            particles_[i].pitch = dist_pitch(rngs_[tid]);
+            particles_[i].yaw = dist_yaw(rngs_[tid]);
             particles_[i].weight = 1.0 / num_particles_;
         }
 
+
+        
         // Reset map-based pose
         map_based_pose_.x = x;
         map_based_pose_.y = y;
@@ -528,8 +548,10 @@ private:
     void resampleParticles() {
         std::vector<double> cdf(num_particles_);
         cdf[0] = particles_[0].weight;
+
+        // Compute cumulative distribution function (CDF)
         for (int i = 1; i < num_particles_; i++) {
-            cdf[i] = cdf[i-1] + particles_[i].weight;
+            cdf[i] = cdf[i - 1] + particles_[i].weight;
         }
 
         std::vector<Particle> new_particles(num_particles_);
@@ -537,18 +559,29 @@ private:
         std::uniform_real_distribution<double> dist(0.0, step);
         double r = dist(rng_);
 
-        int idx = 0;
+        // Precompute the resampling indices
+        std::vector<int> resample_indices(num_particles_);
+
+        #pragma omp parallel for
         for (int i = 0; i < num_particles_; i++) {
-            double u = r + i*step;
-            while (u > cdf[idx]) {
-                idx++;
-                if (idx >= num_particles_) idx = num_particles_ - 1;
-            }
-            new_particles[i] = particles_[idx];
+            double u = r + i * step;
+
+            // Binary search for the index in the CDF
+            int idx = std::lower_bound(cdf.begin(), cdf.end(), u) - cdf.begin();
+            if (idx >= num_particles_) idx = num_particles_ - 1;
+            resample_indices[i] = idx;
+        }
+
+        // Reassign particles based on resampling indices
+        #pragma omp parallel for
+        for (int i = 0; i < num_particles_; i++) {
+            new_particles[i] = particles_[resample_indices[i]];
             new_particles[i].weight = 1.0 / num_particles_;
         }
+
         particles_ = new_particles;
     }
+
 
     void poseMean(double &x, double &y, double &z, double &roll, double &pitch, double &yaw) {
         x = 0.0; 
@@ -692,6 +725,7 @@ private:
     double init_x_std_, init_y_std_, init_yaw_std_,init_z_std_, init_roll_std_, init_pitch_std_;
     double voxel_size_, voxel_scan_size_;
 
+    std::vector<std::mt19937> rngs_;
     std::mt19937 rng_;
 
     struct {
