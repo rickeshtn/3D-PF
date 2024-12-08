@@ -28,7 +28,7 @@ include_directories(
   ${NDT_OMP_INCLUDE_DIRS}
 )
 
-add_executable(lidar_localization_node src/localization.cpp src/ukf_ctrv.cpp)
+add_executable(lidar_localization_node src/localization.cpp)
 target_link_libraries(lidar_localization_node
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
