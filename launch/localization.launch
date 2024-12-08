@@ -1,0 +1,20 @@
+<launch>
+  <node pkg="lidar_ndt_localization" type="lidar_localization_node" name="lidar_localization_node" output="screen">
+    <param name="map_path" value="/home/rickeshtn/Projects/berlin_company_data/ros1_accumulated_cloud/map_Manual.pcd" />
+
+    <!-- Number of particles to test different configurations -->
+    <param name="num_particles" value="1000" />
+
+    <!-- Resample threshold to manipulate the particle filter's performance -->
+    <param name="resample_threshold" value="0.75" />
+
+    <!-- Standard deviations for initialization -->
+    <param name="init_x_std" value="1.0" />
+    <param name="init_y_std" value="1.0" />
+    <param name="init_yaw_std" value="0.25" />
+
+    <!-- Voxel size for downsampling the map -->
+    <param name="voxel_size" value="0.5" />
+
+  </node>
+</launch>
