@@ -35,13 +35,21 @@ public:
         pnh_.param<double>("voxel_size", voxel_size_, 0.5); 
         pnh_.param<double>("voxel_scan_size_", voxel_scan_size_, 0.01); 
 
-        std::string csv_filename;
-        pnh_.param<std::string>("pose_csv_file", csv_filename, "/tmp/pose_log.csv");
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+        std::ostringstream filename_stream;
+        filename_stream << "pose_log_"
+                        << std::put_time(std::localtime(&now_time), "%Y%m%d_%H%M%S")
+                        << ".csv";
+        std::string csv_filename = filename_stream.str();
+
+        //pnh_.param<std::string>("pose_csv_file", csv_filename, "pose_log.csv");
         pose_log_.open(csv_filename.c_str(), std::ios::out | std::ios::trunc);
         if (!pose_log_) {
             ROS_WARN("Failed to open pose log file: %s", csv_filename.c_str());
         } else {
-            pose_log_ << "timestamp,x,y,yaw\n"; // Write header line
+            pose_log_ << "timestamp,x,y,z,roll,pitch,yaw,inside_score\n"; // Write header line
+            ROS_INFO_STREAM("Logging to file: " << csv_filename);
         }
 
         ROS_INFO_STREAM("parameters:");
@@ -500,7 +508,7 @@ private:
         pcl::transformPointCloud(filtered_scan, *mean_transformed_scan, mean_transform);
         double inside_score = insideMapScore(mean_transformed_scan);
 
-        if (inside_score == 0.0) {
+        if (inside_score < 0.01) {
             ROS_WARN("Inside map score is 0. Reinitializing particles.");
             reinitializeParticles();
             return;
@@ -509,7 +517,7 @@ private:
         ROS_INFO_STREAM("Inside map score: " << inside_score);
 
         // Publish pose & path
-        publishPose();
+        publishPose(inside_score);
     }
 
     double computeWeight(const pcl::PointCloud<pcl::PointXYZ>::Ptr &scan) {
@@ -616,7 +624,7 @@ private:
     }
 
 
-    void publishPose() {
+    void publishPose(double inside_score) {
         double x = 0.0, y = 0.0, z = 0.0;
         double roll = 0.0, pitch = 0.0, yaw = 0.0;
 
@@ -665,7 +673,8 @@ private:
                     << z << "," 
                     << roll << "," 
                     << pitch << "," 
-                    << yaw << "\n";
+                  << yaw << "," 
+                  << inside_score << "\n";
             pose_log_.flush();
         }
 
